@@ -325,8 +325,6 @@ class CoffeaTaskvine(Manager):
         self.stats_coffea["events_submitted"] += len(t)
 
     def _final_accumulation(self, accumulator):
-        return accumulator
-        
         if len(self.tasks_to_accumulate) < 1:
             self.console.warn("No results available.")
             return accumulator
@@ -421,12 +419,15 @@ class CoffeaTaskvine(Manager):
         sc = self.stats_coffea
         self._items_empty = False
 
+        last_accum_task = []
         while True:
             if self.empty():
                 if early_terminate or self._items_empty:
                     break
-                if sc["events_total"] <= sc["events_processed"]:
+                if sc["events_total"] <= len(last_accum_task):
                     break
+                if sc["events_total"] <= sc["events_processed"]:
+                    self._submit_accum_tasks(infile_procc_fn, last=True)
 
             self._submit_processing_tasks(infile_procc_fn, items)
 
@@ -440,8 +441,6 @@ class CoffeaTaskvine(Manager):
                 task.resubmit(self)
                 continue
 
-            self.tasks_to_accumulate.append(task)
-
             if re.match("processing", task.category):
                 self._add_task_report(task)
                 sc["events_processed"] += len(task)
@@ -449,13 +448,16 @@ class CoffeaTaskvine(Manager):
                 self._update_chunksize()
             elif task.category == "accumulating":
                 sc["accumulations_done"] += 1
+                last_accum_task = task
             else:
                 raise RuntimeError(f"Unrecognized task category {task.category}")
+
+            self.tasks_to_accumulate.append(task)
 
             self._submit_accum_tasks(infile_accum_fn)
             self._update_bars()
 
-    def _submit_accum_tasks(self, infile_accum_fn):
+    def _submit_accum_tasks(self, infile_accum_fn, last=False):
         treereduction = self.executor.treereduction
 
         sc = self.stats_coffea
@@ -465,7 +467,9 @@ class CoffeaTaskvine(Manager):
         if len(self.tasks_to_accumulate) < (2 * treereduction) - 1 and (not force):
             return
 
-        if force:
+        if last:
+            min_accum = 1  # so we can bring back the results
+        elif force:
             min_accum = 2
         else:
             min_accum = treereduction
@@ -480,7 +484,7 @@ class CoffeaTaskvine(Manager):
             next_to_accum = self.tasks_to_accumulate[0:end]
             self.tasks_to_accumulate = self.tasks_to_accumulate[end:]
 
-            accum_task = AccumCoffeaTaskvineTask(self, infile_accum_fn, next_to_accum)
+            accum_task = AccumCoffeaTaskvineTask(self, infile_accum_fn, next_to_accum, bring_back=force or last)
             self.submit(accum_task)
             sc["accumulations_submitted"] += 1
 
@@ -898,10 +902,8 @@ class PreProcCoffeaTaskvineTask(CoffeaTaskvineTask):
             # filesystem). Not transfering file.
             pass
         else:
-            self.add_input(
-                item.filename, remote_name=item.filename
-            )
-
+            f = queue.declare_file(item.filename, cache="always")
+            self.add_input(f, remote_name=item.filename)
         self.fin_size = 0
 
     def clone(self, queue):
@@ -943,10 +945,8 @@ class ProcCoffeaTaskvineTask(CoffeaTaskvineTask):
             # filesystem). Not transfering file.
             pass
         else:
-            self.add_input(
-                item.filename, remote_name=item.filename
-            )
-
+            f = queue.declare_file(item.filename, cache="always")
+            self.add_input(f, remote_name=item.filename)
         self.fin_size = 0
 
     def clone(self, queue):
@@ -1040,6 +1040,7 @@ class AccumCoffeaTaskvineTask(CoffeaTaskvineTask):
         infile_fn,
         tasks_to_accumulate,
         itemid=None,
+        bring_back=False,
     ):
         if not itemid:
             itemid = "accum_{}".format(CoffeaTaskvineTask.tasks_counter)
@@ -1050,14 +1051,12 @@ class AccumCoffeaTaskvineTask(CoffeaTaskvineTask):
         args = []
         for i, t in enumerate(self.tasks_to_accumulate):
             args.append(f'result.{i}')
-        
-        super().__init__(queue, False, infile_fn, [args], itemid)
-        
+
+        super().__init__(queue, bring_back, infile_fn, [args], itemid)
         for i, t in enumerate(self.tasks_to_accumulate):
             self.add_input(t.output_file, f'result.{i}')
 
         self.set_category("accumulating")
-        
         self.fin_size = sum(t.fout_size for t in tasks_to_accumulate)
 
     def cleanup_inputs(self):
